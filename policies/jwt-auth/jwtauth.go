@@ -18,34 +18,59 @@
 package jwtauth
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	policy "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
+	"github.com/wso2/api-platform/sdk/core/utils/cache"
 )
 
 const (
 	AuthType = "jwt"
+
+	// defaultTokenCacheMaxSize bounds the total number of cached verdicts (positive and
+	// negative) across all APIs. The SDK cache fixes its size at construction, so a changed
+	// cacheMaxSize is applied by rebuilding the cache (see ensureTokenCache).
+	defaultTokenCacheMaxSize = 100_000
+
+	// defaultTokenCacheTtl caps how long a successfully verified token is trusted from cache,
+	// bounding the revocation/staleness window (see cachedVerdict).
+	defaultTokenCacheTtl = 5 * time.Minute
+
+	// defaultNegativeCacheTtl caps how long a deterministic verification failure (expired or
+	// malformed token) is served from cache without re-verification. Kept short since it is
+	// purely a DoS/retry-absorption optimization.
+	defaultNegativeCacheTtl = 30 * time.Second
 )
+
+// errTokenExpired is returned by validateTokenWithSignature's exp check so callers can
+// distinguish it, via errors.Is, from other verification failures: an expired token can never
+// become valid again, so (unlike e.g. a JWKS fetch error or a not-yet-valid nbf) it is safe to
+// negatively cache.
+var errTokenExpired = errors.New("token expired")
 
 // standardJWTClaims lists registered JWT claim names (RFC 7519) and common OAuth2 claims.
 // These are represented as typed fields on AuthContext and excluded from Properties.
@@ -85,11 +110,32 @@ type JwtAuthPolicy struct {
 	cacheStore map[string]*CachedJWKS
 	cacheTTLs  map[string]time.Time
 	httpClient *http.Client
+
+	// tokenCacheMu guards the tokenCache pointer and tokenCacheSize. The SDK cache fixes its
+	// size at construction (no live resize), so a changed cacheMaxSize is applied by swapping
+	// in a new cache. Reads take the RLock and copy the pointer so an in-flight request keeps
+	// using a consistent cache even if a concurrent deployment rebuilds it.
+	tokenCacheMu   sync.RWMutex
+	tokenCache     *cache.InMemoryCache[cachedVerdict] // shared verdict cache for all APIs; globally bounded by cacheMaxSize
+	tokenCacheSize int
 }
 
 // CachedJWKS stores cached JWKS data
 type CachedJWKS struct {
 	Keys map[string]crypto.PublicKey
+}
+
+// cachedVerdict stores the outcome of a signature verification, keyed by a hash of the
+// verification config and the raw token (see buildTokenCacheKey). ok=true is a successful
+// verification (claims holds the verified claim set); ok=false is a deterministic, permanently
+// invalid failure (expired or malformed token only — see errTokenExpired) that is safe to
+// short-circuit on repeat presentation. expiresAt is enforced on read (see getCachedVerdict)
+// since the SDK cache itself is created with ttl=0.
+type cachedVerdict struct {
+	ok        bool
+	claims    jwt.MapClaims
+	reason    string
+	expiresAt time.Time
 }
 
 // KeyManager represents a key manager with either remote JWKS or local certificate
@@ -115,8 +161,8 @@ type RemoteJWKS struct {
 
 // LocalCert holds local certificate configuration
 type LocalCert struct {
-	Inline          string         // Inline PEM-encoded certificate
-	CertificatePath string         // Path to certificate file
+	Inline          string           // Inline PEM-encoded certificate
+	CertificatePath string           // Path to certificate file
 	PublicKey       crypto.PublicKey // Parsed public key (RSA or ECDSA)
 }
 
@@ -144,13 +190,136 @@ var ins = &JwtAuthPolicy{
 	httpClient: &http.Client{
 		Timeout: 5 * time.Second,
 	},
+	tokenCache:     newTokenCache(defaultTokenCacheMaxSize),
+	tokenCacheSize: defaultTokenCacheMaxSize,
 }
 
-// GetPolicy is the v1alpha2 factory entry point (loaded by v1alpha2 kernels).
+// newTokenCache builds the shared verdict cache, globally bounded by maxSize across all APIs.
+// ttl is 0 because expiry is enforced per entry in getCachedVerdict; once full, the cache's LRU
+// policy evicts the least-recently-used entry across all APIs, enforcing a single global bound.
+func newTokenCache(maxSize int) *cache.InMemoryCache[cachedVerdict] {
+	return cache.NewInMemoryCache[cachedVerdict]("jwt-auth-validated-tokens", maxSize, 0, cache.LRUEvictionPolicy, slog.Default())
+}
+
+// ensureTokenCache (re)builds the shared token cache when the configured global size changes.
+// The SDK cache fixes its size at construction (there is no live resize), so applying a new
+// cacheMaxSize means replacing the cache, which flushes all entries. This happens only on the
+// first deployment or a genuine cacheMaxSize change — steady-state redeploys leave it untouched.
+func (p *JwtAuthPolicy) ensureTokenCache(maxSize int) {
+	p.tokenCacheMu.RLock()
+	if p.tokenCache != nil && p.tokenCacheSize == maxSize {
+		p.tokenCacheMu.RUnlock()
+		return
+	}
+	p.tokenCacheMu.RUnlock()
+
+	p.tokenCacheMu.Lock()
+	defer p.tokenCacheMu.Unlock()
+	if p.tokenCache != nil && p.tokenCacheSize == maxSize {
+		return
+	}
+	slog.Debug("JWT Auth Policy: Rebuilding token verdict cache due to cacheMaxSize change, all cached verdicts flushed",
+		"previousMaxSize", p.tokenCacheSize,
+		"newMaxSize", maxSize,
+	)
+	p.tokenCache = newTokenCache(maxSize)
+	p.tokenCacheSize = maxSize
+}
+
+// currentTokenCache returns the live token cache pointer under the read lock, so callers operate
+// on a consistent instance even if a concurrent deployment rebuilds the cache.
+func (p *JwtAuthPolicy) currentTokenCache() *cache.InMemoryCache[cachedVerdict] {
+	p.tokenCacheMu.RLock()
+	defer p.tokenCacheMu.RUnlock()
+	return p.tokenCache
+}
+
+// getCachedVerdict returns a previously cached verification verdict (positive or negative) if it
+// exists and has not yet expired. Because the SDK cache never expires entries on its own
+// (ttl=0), expiry is enforced here against the verdict's stored expiresAt: an entry past its
+// window is deleted and reported as a miss.
+func (p *JwtAuthPolicy) getCachedVerdict(ctx context.Context, key string) (cachedVerdict, bool) {
+	tc := p.currentTokenCache()
+	if tc == nil {
+		return cachedVerdict{}, false
+	}
+	cacheKey := cache.CacheKey{Key: key}
+	v, ok := tc.Get(ctx, cacheKey)
+	if !ok {
+		return cachedVerdict{}, false
+	}
+	if !time.Now().Before(v.expiresAt) {
+		slog.Debug("JWT Auth Policy: Cached verdict found but expired, evicting",
+			"cacheKey", key,
+			"expiresAt", v.expiresAt,
+		)
+		_ = tc.Delete(ctx, cacheKey)
+		return cachedVerdict{}, false
+	}
+	return v, true
+}
+
+// putVerdict stores a verification verdict (positive or negative) under key. When the shared
+// cache is full, its LRU policy evicts the least-recently-used entry across all APIs to make room.
+func (p *JwtAuthPolicy) putVerdict(ctx context.Context, key string, verdict cachedVerdict) {
+	tc := p.currentTokenCache()
+	if tc == nil {
+		return
+	}
+	_ = tc.Set(ctx, cache.CacheKey{Key: key}, verdict)
+}
+
+// buildTokenCacheKey returns a cache key that is a complete function of the verification
+// verdict: fingerprint folds in everything that determines the verdict but is not part of the
+// token itself (API identity plus verification config), and the token supplies the rest. The
+// token is hashed (never stored or logged raw) to keep the bearer secret out of cache keys and
+// bound key length.
+func buildTokenCacheKey(fingerprint, token string) string {
+	sum := sha256.Sum256([]byte(fingerprint + "\x00" + token))
+	return fmt.Sprintf("%x", sum)
+}
+
+// tokenConfigFingerprint renders the token-shaping/verification configuration as a deterministic
+// string. apiId/apiName isolate the shared singleton cache per API even when two APIs would
+// otherwise see identical tokens. keyManagersRaw is JSON-marshalled as configured (not the
+// parsed/expensive form), so computing the fingerprint never requires cert/TLS parsing — that
+// parsing happens only on a cache miss. A redeploy that changes any of these fields yields a
+// different fingerprint (a cache miss), so a token is never trusted under stale config.
+func tokenConfigFingerprint(apiId, apiName string, keyManagersRaw interface{}, validateIssuer bool, issuers []string, leeway time.Duration) string {
+	kmBytes, err := json.Marshal(keyManagersRaw)
+	if err != nil {
+		// Should not happen for values decoded from JSON config, but never let a marshal
+		// failure silently collapse the fingerprint to a shared/colliding key.
+		kmBytes = []byte(fmt.Sprintf("%v", keyManagersRaw))
+	}
+	var buf bytes.Buffer
+	buf.WriteString(apiId)
+	buf.WriteByte('|')
+	buf.WriteString(apiName)
+	buf.WriteByte('|')
+	buf.Write(kmBytes)
+	buf.WriteByte('|')
+	buf.WriteString(strconv.FormatBool(validateIssuer))
+	buf.WriteByte('|')
+	buf.WriteString(strings.Join(issuers, ","))
+	buf.WriteByte('|')
+	buf.WriteString(leeway.String())
+	return buf.String()
+}
+
+// GetPolicy is the v1alpha2 factory entry point (loaded by v1alpha2 kernels). It applies the
+// global cacheMaxSize from systemParameters to the shared verdict cache. Redeploy invalidation
+// of individual entries is handled implicitly by the cache key (see tokenConfigFingerprint); a
+// changed cacheMaxSize additionally rebuilds the whole cache (see ensureTokenCache).
 func GetPolicy(
 	metadata policy.PolicyMetadata,
 	params map[string]interface{},
 ) (policy.Policy, error) {
+	maxSize := getIntParam(params, "cacheMaxSize", defaultTokenCacheMaxSize)
+	if maxSize <= 0 {
+		maxSize = defaultTokenCacheMaxSize
+	}
+	ins.ensureTokenCache(maxSize)
 	return ins, nil
 }
 
@@ -194,7 +363,7 @@ func (p *JwtAuthPolicy) validateTokenWithSignature(tokenString string, unverifie
 				"expTime", expTime,
 				"now", now,
 			)
-			return nil, fmt.Errorf("token expired")
+			return nil, errTokenExpired
 		}
 		slog.Debug("JWT Auth Policy: Token expiration check passed")
 	} else {
@@ -1174,6 +1343,9 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 	jwksFetchRetryCount := getIntParam(params, "jwksFetchRetryCount", 3)
 	jwksFetchRetryIntervalStr := getStringParam(params, "jwksFetchRetryInterval", "2s")
 	validateIssuer := getBoolParam(params, "validateIssuer", true)
+	tokenCaching := getBoolParam(params, "tokenCaching", true)
+	tokenCacheTtlStr := getStringParam(params, "tokenCacheTtl", "5m")
+	negativeCacheTtlStr := getStringParam(params, "negativeCacheTtl", "30s")
 
 	slog.Debug("JWT Auth Policy: Configuration loaded",
 		"headerName", headerName,
@@ -1188,6 +1360,9 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 		"jwksFetchRetryCount", jwksFetchRetryCount,
 		"jwksFetchRetryInterval", jwksFetchRetryIntervalStr,
 		"validateIssuer", validateIssuer,
+		"tokenCaching", tokenCaching,
+		"tokenCacheTtl", tokenCacheTtlStr,
+		"negativeCacheTtl", negativeCacheTtlStr,
 	)
 
 	leeway, err := time.ParseDuration(leewayStr)
@@ -1226,18 +1401,126 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 		)
 		jwksFetchRetryInterval = 2 * time.Second
 	}
+	tokenCacheTtl, err := time.ParseDuration(tokenCacheTtlStr)
+	if err != nil {
+		slog.Debug("JWT Auth Policy: Failed to parse tokenCacheTtl duration, using default",
+			"tokenCacheTtlStr", tokenCacheTtlStr,
+			"error", err,
+			"defaultTokenCacheTtl", defaultTokenCacheTtl,
+		)
+		tokenCacheTtl = defaultTokenCacheTtl
+	}
+	negativeCacheTtl, err := time.ParseDuration(negativeCacheTtlStr)
+	if err != nil {
+		slog.Debug("JWT Auth Policy: Failed to parse negativeCacheTtl duration, using default",
+			"negativeCacheTtlStr", negativeCacheTtlStr,
+			"error", err,
+			"defaultNegativeCacheTtl", defaultNegativeCacheTtl,
+		)
+		negativeCacheTtl = defaultNegativeCacheTtl
+	}
 
 	slog.Debug("JWT Auth Policy: Parsed duration values",
 		"leeway", leeway,
 		"jwksCacheTtl", jwksCacheTtl,
 		"jwksFetchTimeout", jwksFetchTimeout,
 		"jwksFetchRetryInterval", jwksFetchRetryInterval,
+		"tokenCacheTtl", tokenCacheTtl,
+		"negativeCacheTtl", negativeCacheTtl,
 	)
 
 	keyManagersRaw, ok := params["keyManagers"]
 	if !ok {
 		slog.Debug("JWT Auth Policy: Key managers not configured in params")
 		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "key managers not configured")
+	}
+
+	userIssuers := getStringArrayParam(params, "issuers", []string{})
+	userAudiences := getStringArrayParam(params, "audiences", []string{})
+	userRequiredScopes := getStringArrayParam(params, "requiredScopes", []string{})
+	userRequiredClaims := getStringMapParam(params, "requiredClaims", map[string]string{})
+	userClaimMappings := getStringMapParam(params, "claimMappings", map[string]string{})
+	userIdClaim := getStringParam(params, "userIdClaim", "sub")
+	userAuthHeaderPrefix := getStringParam(params, "authHeaderPrefix", "")
+	forwardToken := getBoolParam(params, "forwardToken", true)
+	forwardedTokenHeader := getStringParam(params, "forwardedTokenHeader", "x-forwarded-authorization")
+	forwardTokenStripScheme := getBoolParam(params, "forwardTokenStripScheme", false)
+
+	slog.Debug("JWT Auth Policy: User configuration loaded",
+		"issuers", userIssuers,
+		"audiences", userAudiences,
+		"requiredScopes", userRequiredScopes,
+		"requiredClaimsCount", len(userRequiredClaims),
+		"claimMappingsCount", len(userClaimMappings),
+		"userIdClaim", userIdClaim,
+		"authHeaderPrefix", userAuthHeaderPrefix,
+		"forwardTokenStripScheme", forwardTokenStripScheme,
+	)
+
+	if userAuthHeaderPrefix != "" {
+		slog.Debug("JWT Auth Policy: Overriding auth header scheme with user prefix",
+			"originalScheme", authHeaderScheme,
+			"newScheme", userAuthHeaderPrefix,
+		)
+		authHeaderScheme = userAuthHeaderPrefix
+	}
+
+	authHeaders := getDownstreamHeaders(reqCtx.Downstream, reqCtx.Headers).Get(strings.ToLower(headerName))
+	if len(authHeaders) == 0 {
+		slog.Debug("JWT Auth Policy: Missing authorization header",
+			"headerName", headerName,
+		)
+		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "missing authorization header")
+	}
+
+	authHeader := authHeaders[0]
+	slog.Debug("JWT Auth Policy: Authorization header found",
+		"headerName", headerName,
+		"headerValueLength", len(authHeader),
+	)
+
+	token := extractToken(authHeader, authHeaderScheme)
+	if token == "" {
+		slog.Debug("JWT Auth Policy: Failed to extract token from authorization header",
+			"authHeaderScheme", authHeaderScheme,
+		)
+		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "invalid authorization header format")
+	}
+
+	slog.Debug("JWT Auth Policy: Token extracted successfully",
+		"tokenLength", len(token),
+	)
+
+	// Cache boundary: everything above is cheap (header/param reads). Everything below —
+	// unverified parsing, key-manager/certificate/TLS parsing, and signature verification — is
+	// exactly what the verdict cache exists to skip on a repeat presentation of the same token
+	// under the same verification config (see tokenConfigFingerprint).
+	var cacheKey string
+	if tokenCaching {
+		fingerprint := tokenConfigFingerprint(reqCtx.APIId, reqCtx.APIName, keyManagersRaw, validateIssuer, userIssuers, leeway)
+		cacheKey = buildTokenCacheKey(fingerprint, token)
+		if verdict, hit := p.getCachedVerdict(ctx, cacheKey); hit {
+			if verdict.ok {
+				slog.Debug("JWT Auth Policy: Token verdict cache hit (verified)",
+					"cacheKey", cacheKey,
+					"expiresAt", verdict.expiresAt,
+				)
+				return p.finishAuthentication(reqCtx, verdict.claims, onFailureStatusCode, errorMessageFormat, errorMessage,
+					userAudiences, userRequiredScopes, userRequiredClaims, userClaimMappings, userIdClaim,
+					headerName, authHeader, token, forwardToken, forwardedTokenHeader, forwardTokenStripScheme)
+			}
+			slog.Debug("JWT Auth Policy: Token verdict cache hit (failure)",
+				"cacheKey", cacheKey,
+				"reason", verdict.reason,
+				"expiresAt", verdict.expiresAt,
+			)
+			return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, verdict.reason)
+		}
+		slog.Debug("JWT Auth Policy: Token verdict cache miss, proceeding to full verification",
+			"cacheKey", cacheKey,
+		)
+	} else {
+		slog.Debug("JWT Auth Policy: Token verdict caching disabled, performing full verification")
 	}
 
 	slog.Debug("JWT Auth Policy: Starting to parse key managers configuration")
@@ -1365,67 +1648,18 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 		"count", len(keyManagers),
 	)
 
-	userIssuers := getStringArrayParam(params, "issuers", []string{})
-	userAudiences := getStringArrayParam(params, "audiences", []string{})
-	userRequiredScopes := getStringArrayParam(params, "requiredScopes", []string{})
-	userRequiredClaims := getStringMapParam(params, "requiredClaims", map[string]string{})
-	userClaimMappings := getStringMapParam(params, "claimMappings", map[string]string{})
-	userIdClaim := getStringParam(params, "userIdClaim", "sub")
-	userAuthHeaderPrefix := getStringParam(params, "authHeaderPrefix", "")
-	forwardToken := getBoolParam(params, "forwardToken", true)
-	forwardedTokenHeader := getStringParam(params, "forwardedTokenHeader", "x-forwarded-authorization")
-	forwardTokenStripScheme := getBoolParam(params, "forwardTokenStripScheme", false)
-
-	slog.Debug("JWT Auth Policy: User configuration loaded",
-		"issuers", userIssuers,
-		"audiences", userAudiences,
-		"requiredScopes", userRequiredScopes,
-		"requiredClaimsCount", len(userRequiredClaims),
-		"claimMappingsCount", len(userClaimMappings),
-		"userIdClaim", userIdClaim,
-		"authHeaderPrefix", userAuthHeaderPrefix,
-		"forwardTokenStripScheme", forwardTokenStripScheme,
-	)
-
-	if userAuthHeaderPrefix != "" {
-		slog.Debug("JWT Auth Policy: Overriding auth header scheme with user prefix",
-			"originalScheme", authHeaderScheme,
-			"newScheme", userAuthHeaderPrefix,
-		)
-		authHeaderScheme = userAuthHeaderPrefix
-	}
-
-	authHeaders := reqCtx.Headers.Get(strings.ToLower(headerName))
-	if len(authHeaders) == 0 {
-		slog.Debug("JWT Auth Policy: Missing authorization header",
-			"headerName", headerName,
-		)
-		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "missing authorization header")
-	}
-
-	authHeader := authHeaders[0]
-	slog.Debug("JWT Auth Policy: Authorization header found",
-		"headerName", headerName,
-		"headerValueLength", len(authHeader),
-	)
-
-	token := extractToken(authHeader, authHeaderScheme)
-	if token == "" {
-		slog.Debug("JWT Auth Policy: Failed to extract token from authorization header",
-			"authHeaderScheme", authHeaderScheme,
-		)
-		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "invalid authorization header format")
-	}
-
-	slog.Debug("JWT Auth Policy: Token extracted successfully",
-		"tokenLength", len(token),
-	)
-
 	unverifiedToken, _, err := jwt.NewParser().ParseUnverified(token, jwt.MapClaims{})
 	if err != nil {
 		slog.Debug("JWT Auth Policy: Failed to parse token",
 			"error", err,
 		)
+		if tokenCaching {
+			slog.Debug("JWT Auth Policy: Caching negative verdict (malformed token)",
+				"cacheKey", cacheKey,
+				"negativeCacheTtl", negativeCacheTtl,
+			)
+			p.putVerdict(ctx, cacheKey, cachedVerdict{ok: false, reason: "invalid token format", expiresAt: time.Now().Add(negativeCacheTtl)})
+		}
 		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, "invalid token format")
 	}
 
@@ -1441,10 +1675,63 @@ func (p *JwtAuthPolicy) OnRequestHeaders(ctx context.Context, reqCtx *policy.Req
 		slog.Debug("JWT Auth Policy: Token validation failed",
 			"error", err,
 		)
-		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, fmt.Sprintf("token validation failed: %v", err))
+		failureReason := fmt.Sprintf("token validation failed: %v", err)
+		if tokenCaching && errors.Is(err, errTokenExpired) {
+			slog.Debug("JWT Auth Policy: Caching negative verdict (token expired)",
+				"cacheKey", cacheKey,
+				"negativeCacheTtl", negativeCacheTtl,
+			)
+			p.putVerdict(ctx, cacheKey, cachedVerdict{ok: false, reason: failureReason, expiresAt: time.Now().Add(negativeCacheTtl)})
+		} else if tokenCaching {
+			slog.Debug("JWT Auth Policy: Token validation failure not cached (not a conservatively-cacheable reason)",
+				"cacheKey", cacheKey,
+			)
+		}
+		return p.handleAuthFailureHeaders(reqCtx.SharedContext, onFailureStatusCode, errorMessageFormat, errorMessage, failureReason)
 	}
 
 	slog.Debug("JWT Auth Policy: Token signature validated successfully")
+
+	if tokenCaching {
+		// expiresAt is capped at the sooner of "now + tokenCacheTtl" and the token's own
+		// exp (minus leeway), so a live cache entry is always still within the token's
+		// validity window — a hit therefore needs no crypto or exp/nbf re-check.
+		expiresAt := time.Now().Add(tokenCacheTtl)
+		if expFloat, ok := claims["exp"].(float64); ok {
+			tokenExpiry := time.Unix(int64(expFloat), 0).Add(-leeway)
+			if tokenExpiry.Before(expiresAt) {
+				expiresAt = tokenExpiry
+			}
+		}
+		if expiresAt.After(time.Now()) {
+			slog.Debug("JWT Auth Policy: Caching positive verdict",
+				"cacheKey", cacheKey,
+				"expiresAt", expiresAt,
+			)
+			p.putVerdict(ctx, cacheKey, cachedVerdict{ok: true, claims: claims, expiresAt: expiresAt})
+		} else {
+			slog.Debug("JWT Auth Policy: Skipping positive cache write, computed expiry is not in the future",
+				"cacheKey", cacheKey,
+				"expiresAt", expiresAt,
+			)
+		}
+	}
+
+	return p.finishAuthentication(reqCtx, claims, onFailureStatusCode, errorMessageFormat, errorMessage,
+		userAudiences, userRequiredScopes, userRequiredClaims, userClaimMappings, userIdClaim,
+		headerName, authHeader, token, forwardToken, forwardedTokenHeader, forwardTokenStripScheme)
+}
+
+// finishAuthentication runs the checks that must always be re-evaluated even on a verdict-cache
+// hit — audience, required scopes, required claims — since they depend on per-request config
+// deliberately kept out of the cache key, and then builds the upstream header modifications on
+// success. Shared by both the cache-hit and cache-miss paths in OnRequestHeaders so the two
+// converge on identical downstream behavior.
+func (p *JwtAuthPolicy) finishAuthentication(reqCtx *policy.RequestHeaderContext, claims jwt.MapClaims,
+	onFailureStatusCode int, errorMessageFormat, errorMessage string,
+	userAudiences, userRequiredScopes []string, userRequiredClaims, userClaimMappings map[string]string,
+	userIdClaim, headerName, authHeader, token string,
+	forwardToken bool, forwardedTokenHeader string, forwardTokenStripScheme bool) policy.RequestHeaderAction {
 
 	if len(userAudiences) > 0 {
 		aud := parseAudience(claims["aud"])
@@ -1586,13 +1873,29 @@ func (p *JwtAuthPolicy) handleAuthSuccessHeaders(shared *policy.SharedContext, c
 		}
 	}
 
-	for claimName, headerName := range claimMappings {
-		if claimValue, ok := claims[claimName]; ok {
-			if forwardToken && http.CanonicalHeaderKey(headerName) == canonicalOut {
-				continue
-			}
-			modifications.HeadersToSet[headerName] = claimValueToString(claimValue)
+	type mappedHeader struct {
+		name  string
+		value string
+	}
+	mappedHeaders := make(map[string]mappedHeader, len(claimMappings))
+	for claimName, configuredHeaderName := range claimMappings {
+		canonicalHeaderName := http.CanonicalHeaderKey(configuredHeaderName)
+		if forwardToken && canonicalHeaderName == canonicalOut {
+			continue
 		}
+
+		header, initialized := mappedHeaders[canonicalHeaderName]
+		if !initialized {
+			header.name = configuredHeaderName
+		}
+		if claimValue, ok := claims[claimName]; ok {
+			header.value = claimValueToString(claimValue)
+		}
+		mappedHeaders[canonicalHeaderName] = header
+	}
+
+	for _, header := range mappedHeaders {
+		modifications.HeadersToSet[header.name] = header.value
 	}
 
 	return modifications

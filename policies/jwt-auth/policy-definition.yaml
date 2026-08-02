@@ -1,5 +1,5 @@
 name: jwt-auth
-version: v1.2.0
+version: v1.2.2
 description: |
   Validates JWT access tokens included in API requests. The gateway verifies the
   token's signature, expiry, issuer, audience, scopes, and required claims.
@@ -181,6 +181,51 @@ systemParameters:
       description: Duration string for JWKS caching (e.g., "5m"). If omitted a default is used.
       default: "5m"
       "wso2/defaultValue": "${config.policy_configurations.jwtauth_v1.jwkscachettl}"
+
+    tokenCaching:
+      type: boolean
+      description: >-
+        Whether to cache token verification verdicts. When true (default), a signature-verified
+        token skips re-verification (unverified parsing, key manager/certificate parsing, and
+        signature checking) on repeat presentation, and a deterministically invalid token
+        (expired or malformed) is also cached so repeated bad tokens are rejected without
+        re-verification. Caching a successful verdict means a revoked token may still be
+        accepted for up to tokenCacheTtl after it was last verified; set to false to force full
+        verification on every request.
+      default: true
+      "wso2/defaultValue": "${config.policy_configurations.jwtauth_v1.tokencaching}"
+
+    tokenCacheTtl:
+      type: string
+      description: >-
+        Maximum duration a successfully verified token is trusted from cache (e.g., "5m"). The
+        actual cache expiry is the sooner of this value and the token's own exp claim (minus
+        leeway), so this bounds how long a revoked token may still be accepted after its last
+        verification.
+      default: "5m"
+      "wso2/defaultValue": "${config.policy_configurations.jwtauth_v1.tokencachettl}"
+
+    negativeCacheTtl:
+      type: string
+      description: >-
+        Duration a deterministically invalid verification verdict (expired or malformed token
+        only) is cached before re-verification is attempted again (e.g., "30s"). Kept short
+        since this is purely a DoS/retry-absorption optimization; transient failures (e.g. JWKS
+        fetch errors) and not-yet-valid (nbf) tokens are never cached, since they may resolve on
+        a later attempt.
+      default: "30s"
+      "wso2/defaultValue": "${config.policy_configurations.jwtauth_v1.negativecachettl}"
+
+    cacheMaxSize:
+      type: integer
+      description: >-
+        Maximum total number of cached verification verdicts (successful and failed, combined)
+        to hold across all APIs (a single global bound, not per-API). When the limit is reached,
+        the cache evicts the least-recently-used existing entries to make room. Changing this
+        value rebuilds the shared cache, which flushes all currently cached verdicts.
+      default: 100000
+      minimum: 1
+      "wso2/defaultValue": "${config.policy_configurations.jwtauth_v1.cachemaxsize}"
 
     jwksFetchTimeout:
       type: string

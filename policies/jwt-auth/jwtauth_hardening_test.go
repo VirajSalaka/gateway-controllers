@@ -176,6 +176,103 @@ func TestJWTAuthPolicy_HappyPath_LocalCert_WithClaimMappings_AndUserIdClaim(t *t
 	}
 }
 
+func TestJWTAuthPolicy_ClaimMappingClearsDownstreamHeaderWhenClaimIsMissing(t *testing.T) {
+	resetJWTAuthSingletonCache(t)
+
+	privateKey, publicKey := generateTestKeys(t)
+	token := createRS256TokenWithKid(t, privateKey, map[string]interface{}{
+		"sub": "user-123",
+		"iss": "https://issuer.example.com",
+	}, "test-kid")
+
+	params := newRemoteParams("http://invalid.local/jwks.json")
+	params["keyManagers"] = []interface{}{
+		map[string]interface{}{
+			"name":   "km-local",
+			"issuer": "https://issuer.example.com",
+			"jwks": map[string]interface{}{
+				"local": map[string]interface{}{
+					"inline": publicKeyToPEM(t, publicKey),
+				},
+			},
+		},
+	}
+	params["claimMappings"] = map[string]interface{}{
+		"email": "X-User-Email",
+	}
+
+	headers := authHeader("Authorization", "Bearer", token)
+	headers["x-user-email"] = []string{"anonymous@example.com"}
+	ctx, action := executeOnRequestHeaders(t, params, headers)
+	assertAuthSuccess(t, ctx, action)
+
+	mods, ok := action.(policy.UpstreamRequestHeaderModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestHeaderModifications, got %T", action)
+	}
+	value, ok := mods.HeadersToSet["X-User-Email"]
+	if !ok {
+		t.Fatal("expected the mapped header to be overwritten when the JWT claim is missing")
+	}
+	if value != "" {
+		t.Fatalf("expected the mapped header to be empty, got %q", value)
+	}
+	for _, headerName := range mods.HeadersToRemove {
+		if strings.EqualFold(headerName, "X-User-Email") {
+			t.Fatal("expected the mapped header to be set to empty rather than removed")
+		}
+	}
+}
+
+func TestJWTAuthPolicy_ClaimMappingPresentClaimWinsForSharedHeader(t *testing.T) {
+	resetJWTAuthSingletonCache(t)
+
+	privateKey, publicKey := generateTestKeys(t)
+	token := createRS256TokenWithKid(t, privateKey, map[string]interface{}{
+		"sub":   "user-123",
+		"iss":   "https://issuer.example.com",
+		"email": "user@example.com",
+	}, "test-kid")
+
+	params := newRemoteParams("http://invalid.local/jwks.json")
+	params["keyManagers"] = []interface{}{
+		map[string]interface{}{
+			"name":   "km-local",
+			"issuer": "https://issuer.example.com",
+			"jwks": map[string]interface{}{
+				"local": map[string]interface{}{
+					"inline": publicKeyToPEM(t, publicKey),
+				},
+			},
+		},
+	}
+	params["claimMappings"] = map[string]interface{}{
+		"email":    "X-User-Identity",
+		"username": "x-user-identity",
+	}
+
+	headers := authHeader("Authorization", "Bearer", token)
+	headers["x-user-identity"] = []string{"attacker"}
+	ctx, action := executeOnRequestHeaders(t, params, headers)
+	assertAuthSuccess(t, ctx, action)
+
+	mods, ok := action.(policy.UpstreamRequestHeaderModifications)
+	if !ok {
+		t.Fatalf("expected UpstreamRequestHeaderModifications, got %T", action)
+	}
+	if value := mods.HeadersToSet["X-User-Identity"]; value != "user@example.com" {
+		t.Fatalf("expected the present claim to win for the shared header, got %q", value)
+	}
+	if _, ok := mods.HeadersToSet["x-user-identity"]; ok {
+		t.Fatal("expected case-insensitive mapping destinations to be consolidated")
+	}
+	for _, headerName := range mods.HeadersToRemove {
+		if strings.EqualFold(headerName, "X-User-Identity") {
+			t.Fatal("expected a present claim to prevent removal of the shared mapped header")
+		}
+	}
+}
+
 func TestJWTAuthPolicy_Negative_MissingAuthorizationHeader(t *testing.T) {
 	resetJWTAuthSingletonCache(t)
 
@@ -489,6 +586,10 @@ func TestJWTAuthPolicy_Edge_JWKSCacheExpiry_Refetches(t *testing.T) {
 
 	params := newRemoteParams(jwksServer.URL + "/jwks.json")
 	params["jwksCacheTtl"] = "15ms"
+	// Disable the token verdict cache so the second identical request re-verifies the
+	// signature (and therefore re-fetches JWKS) instead of being served from cache — this
+	// test is specifically exercising JWKS-level cache expiry, not token-verdict caching.
+	params["tokenCaching"] = false
 
 	token := createTestToken(t, privateKey, map[string]interface{}{
 		"sub": "user-123",
@@ -908,12 +1009,14 @@ func resetJWTAuthSingletonCache(t *testing.T) {
 	ins.cacheStore = make(map[string]*CachedJWKS)
 	ins.cacheTTLs = make(map[string]time.Time)
 	ins.cacheMutex.Unlock()
+	_ = ins.currentTokenCache().Clear(context.Background())
 
 	t.Cleanup(func() {
 		ins.cacheMutex.Lock()
 		ins.cacheStore = make(map[string]*CachedJWKS)
 		ins.cacheTTLs = make(map[string]time.Time)
 		ins.cacheMutex.Unlock()
+		_ = ins.currentTokenCache().Clear(context.Background())
 	})
 }
 

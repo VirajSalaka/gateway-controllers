@@ -111,15 +111,81 @@ func TestCorsPolicy_GetPolicy_AllowCredentialsWildcardRejections(t *testing.T) {
 	}
 }
 
-func TestCorsPolicy_GetPolicy_InvalidOriginRegex(t *testing.T) {
-	_, err := GetPolicy(policy.PolicyMetadata{}, map[string]any{
-		"allowedOrigins": []any{"[invalid-regex"},
+func TestCorsPolicy_GetPolicy_ExactOriginDoesNotMatchLookalikes(t *testing.T) {
+	p := mustGetCorsPolicy(t, map[string]any{
+		"allowedOrigins": []any{"https://abc.xyz.com"},
 	})
-	if err == nil {
-		t.Fatalf("expected invalid origin regex error")
+
+	tests := []struct {
+		origin  string
+		allowed bool
+	}{
+		{origin: "https://abc.xyz.com", allowed: true},
+		{origin: "https://abc.xyz.com.evil.io", allowed: false},
+		{origin: "https://abcXxyz.com", allowed: false},
+		{origin: "https://evil.com/?x=https://abc.xyz.com", allowed: false},
 	}
-	if !strings.Contains(err.Error(), "invalid origin regex") {
-		t.Fatalf("unexpected error: %v", err)
+
+	for _, tt := range tests {
+		t.Run(tt.origin, func(t *testing.T) {
+			if got := p.isOriginAllowed(tt.origin); got != tt.allowed {
+				t.Fatalf("isOriginAllowed(%q) = %t, want %t", tt.origin, got, tt.allowed)
+			}
+		})
+	}
+}
+
+func TestCorsPolicy_GetPolicy_SubdomainWildcard(t *testing.T) {
+	p := mustGetCorsPolicy(t, map[string]any{
+		"allowedOrigins": []any{"http://*.abc.com"},
+	})
+
+	tests := []struct {
+		origin  string
+		allowed bool
+	}{
+		{origin: "http://api.abc.com", allowed: true},
+		{origin: "http://one.two.abc.com", allowed: true},
+		{origin: "https://api.abc.com", allowed: false},
+		{origin: "http://abc.com", allowed: false},
+		{origin: "http://api.abc.com:8443", allowed: false},
+		{origin: "http://api.abc.com.evil.io", allowed: false},
+		{origin: "http://evilabc.com", allowed: false},
+		{origin: "http://evil.com?x=api.abc.com", allowed: false},
+		{origin: "http://evil.com/api.abc.com", allowed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.origin, func(t *testing.T) {
+			if got := p.isOriginAllowed(tt.origin); got != tt.allowed {
+				t.Fatalf("isOriginAllowed(%q) = %t, want %t", tt.origin, got, tt.allowed)
+			}
+		})
+	}
+}
+
+func TestCorsPolicy_GetPolicy_SubdomainWildcardWithPort(t *testing.T) {
+	p := mustGetCorsPolicy(t, map[string]any{
+		"allowedOrigins": []any{"https://*.abc.com:8443"},
+	})
+
+	tests := []struct {
+		origin  string
+		allowed bool
+	}{
+		{origin: "https://one.two.abc.com:8443", allowed: true},
+		{origin: "http://api.abc.com:8443", allowed: false},
+		{origin: "https://api.abc.com", allowed: false},
+		{origin: "https://api.abc.com:9443", allowed: false},
+		{origin: "https://abc.com:8443", allowed: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.origin, func(t *testing.T) {
+			if got := p.isOriginAllowed(tt.origin); got != tt.allowed {
+				t.Fatalf("isOriginAllowed(%q) = %t, want %t", tt.origin, got, tt.allowed)
+			}
+		})
 	}
 }
 
@@ -177,6 +243,30 @@ func TestCorsPolicy_OnRequestHeaders_PreflightSuccess(t *testing.T) {
 	}
 }
 
+func TestCorsPolicy_OnRequestHeaders_PreflightSpecificOriginIncludesVary(t *testing.T) {
+	p := mustGetCorsPolicy(t, map[string]any{
+		"allowedOrigins": []any{"https://allowed.example.com"},
+		"allowedMethods": []any{"GET"},
+	})
+
+	ctx := newCorsRequestHeaderContext("OPTIONS", map[string][]string{
+		"Origin":                        {"https://allowed.example.com"},
+		"Access-Control-Request-Method": {"GET"},
+	})
+
+	action := p.OnRequestHeaders(context.Background(), ctx, nil)
+	resp, ok := action.(policy.ImmediateResponse)
+	if !ok {
+		t.Fatalf("expected ImmediateResponse, got %T", action)
+	}
+	if resp.Headers["Access-Control-Allow-Origin"] != "https://allowed.example.com" {
+		t.Fatalf("unexpected allow-origin header: %q", resp.Headers["Access-Control-Allow-Origin"])
+	}
+	if resp.Headers["Vary"] != "Origin" {
+		t.Fatalf("expected Vary=Origin, got %q", resp.Headers["Vary"])
+	}
+}
+
 func TestCorsPolicy_OnRequestHeaders_PreflightFailure_NotForwarded(t *testing.T) {
 	p := mustGetCorsPolicy(t, map[string]any{
 		"allowedOrigins": []any{"https://allowed.example.com"},
@@ -205,6 +295,27 @@ func TestCorsPolicy_OnRequestHeaders_PreflightFailure_NotForwarded(t *testing.T)
 	}
 }
 
+func TestCorsPolicy_OnRequestHeaders_PreflightRejectsExactOriginLookalike(t *testing.T) {
+	p := mustGetCorsPolicy(t, map[string]any{
+		"allowedOrigins": []any{"https://abc.xyz.com"},
+		"allowedMethods": []any{"GET"},
+	})
+
+	ctx := newCorsRequestHeaderContext("OPTIONS", map[string][]string{
+		"Origin":                        {"https://abc.xyz.com.evil.io"},
+		"Access-Control-Request-Method": {"GET"},
+	})
+
+	action := p.OnRequestHeaders(context.Background(), ctx, nil)
+	resp, ok := action.(policy.ImmediateResponse)
+	if !ok {
+		t.Fatalf("expected ImmediateResponse, got %T", action)
+	}
+	if len(resp.Headers) != 0 {
+		t.Fatalf("expected empty headers for lookalike origin, got %v", resp.Headers)
+	}
+}
+
 func TestCorsPolicy_OnRequestHeaders_PreflightFailure_Forwarded(t *testing.T) {
 	p := mustGetCorsPolicy(t, map[string]any{
 		"allowedOrigins":   []any{"https://allowed.example.com"},
@@ -229,7 +340,7 @@ func TestCorsPolicy_OnRequestHeaders_PreflightFailure_Forwarded(t *testing.T) {
 
 func TestCorsPolicy_OnRequestHeaders_NonPreflightAllowedOrigin(t *testing.T) {
 	p := mustGetCorsPolicy(t, map[string]any{
-		"allowedOrigins":   []any{"^https://allowed\\.example\\.com$"},
+		"allowedOrigins":   []any{"https://allowed.example.com"},
 		"exposedHeaders":   []any{"X-Trace-Id", "X-RateLimit-Remaining"},
 		"allowCredentials": true,
 	})
@@ -261,9 +372,31 @@ func TestCorsPolicy_OnRequestHeaders_NonPreflightAllowedOrigin(t *testing.T) {
 	}
 }
 
+func TestCorsPolicy_OnRequestHeaders_NonPreflightAllowedSubdomainWildcard(t *testing.T) {
+	p := mustGetCorsPolicy(t, map[string]any{
+		"allowedOrigins": []any{"https://*.abc.com"},
+	})
+
+	ctx := newCorsRequestHeaderContext("GET", map[string][]string{
+		"Origin": {"https://one.two.abc.com"},
+	})
+
+	_ = p.OnRequestHeaders(context.Background(), ctx, nil)
+	corsHeaders, ok := ctx.Metadata["cors_headers"].(map[string]string)
+	if !ok {
+		t.Fatal("expected cors_headers metadata to be present")
+	}
+	if corsHeaders["Access-Control-Allow-Origin"] != "https://one.two.abc.com" {
+		t.Fatalf("unexpected allow-origin: %q", corsHeaders["Access-Control-Allow-Origin"])
+	}
+	if corsHeaders["Vary"] != "Origin" {
+		t.Fatalf("expected Vary=Origin, got %q", corsHeaders["Vary"])
+	}
+}
+
 func TestCorsPolicy_OnRequestHeaders_NonPreflightDisallowedOriginSetsStrip(t *testing.T) {
 	p := mustGetCorsPolicy(t, map[string]any{
-		"allowedOrigins": []any{"^https://allowed\\.example\\.com$"},
+		"allowedOrigins": []any{"https://allowed.example.com"},
 	})
 
 	ctx := newCorsRequestHeaderContext("GET", map[string][]string{
@@ -284,7 +417,7 @@ func TestCorsPolicy_OnRequestHeaders_NonPreflightDisallowedOriginSetsStrip(t *te
 
 func TestCorsPolicy_OnRequestHeaders_NonPreflightWithoutOriginNoStrip(t *testing.T) {
 	p := mustGetCorsPolicy(t, map[string]any{
-		"allowedOrigins": []any{"^https://allowed\\.example\\.com$"},
+		"allowedOrigins": []any{"https://allowed.example.com"},
 	})
 
 	ctx := newCorsRequestHeaderContext("GET", nil)

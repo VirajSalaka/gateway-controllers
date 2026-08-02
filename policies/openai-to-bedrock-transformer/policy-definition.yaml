@@ -1,0 +1,44 @@
+name: openai-to-bedrock-transformer
+version: v0.9.0
+description: |
+  Translates OpenAI Chat Completions requests to the AWS Bedrock Converse API
+  (/model/{modelId}/converse and /converse-stream) and rewrites Bedrock
+  responses back to the OpenAI response shape.
+
+  Non-streaming Converse JSON responses become OpenAI ChatCompletion JSON.
+  Streaming responses use Bedrock's binary Amazon event-stream framing
+  (application/vnd.amazon.eventstream); this policy decodes those frames and
+  re-emits them as OpenAI-style Server-Sent Events (data: {chunk}\n\n ...
+  data: [DONE]). It handles the event stream in both buffered and chunk-by-chunk
+  (true streaming) modes. Supports routed and unconditional execution modes.
+
+parameters:
+  type: object
+  additionalProperties: false
+  properties:
+    model:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Bedrock model or inference-profile id placed in the request path
+        (for example anthropic.claude-3-5-sonnet-20241022-v2:0 or
+        us.anthropic.claude-sonnet-4-5-20250929-v1:0). When configured, it
+        overrides the OpenAI "model" field; when omitted, the request's model
+        field is used.
+      minLength: 1
+    providerId:
+      type: string
+      x-wso2-policy-advanced-param: false
+      description: |
+        Provider this translator targets. Used as the upstream cluster name
+        (matching an id or as alias in the LlmProxy additionalProviders list) and, in
+        multi-provider mode, as the key matched (case-insensitive) against
+        SharedContext.Metadata["selected_provider"]. When no provider has been
+        selected upstream (single-provider proxy), the translator always runs;
+        when a provider has been selected, it runs only if the selection
+        matches this provider id. When omitted, routing is left to the route's
+        default upstream.
+      minLength: 1
+systemParameters:
+  type: object
+  properties: {}

@@ -163,7 +163,7 @@ func (p *APIKeyPolicy) authenticate(
 	}
 
 	var valuePrefix string
-	if valuePrefixRaw, ok := params["value-prefix"]; ok {
+	if valuePrefixRaw, ok := params["valuePrefix"]; ok {
 		if vp, ok := valuePrefixRaw.(string); ok {
 			valuePrefix = vp
 		}

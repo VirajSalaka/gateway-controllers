@@ -10,7 +10,7 @@ The CORS (Cross-Origin Resource Sharing) policy handles cross-origin requests by
 ## Features
 
 - Handles CORS preflight (OPTIONS) requests with automatic validation
-- Configurable allowed origins with wildcard and regex pattern support
+- Configurable allowed origins with global and subdomain wildcard support
 - Control over allowed HTTP methods for cross-origin requests
 - Request header validation and filtering
 - Configurable exposed response headers for client-side access
@@ -31,11 +31,11 @@ These parameters are configured per-API/route by the API developer:
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `allowedOrigins` | array | Yes | `["*"]` | List of origins allowed to access the resource. Use `"*"` to allow all origins, or specify exact origins (e.g., `"https://example.com"`) or regex patterns. At least one origin must be specified. When using credentials, specific origins must be listed (no wildcards). |
+| `allowedOrigins` | array | Yes | `["*"]` | List of origins allowed to access the resource. Use `"*"` to allow all origins, specify exact origins (e.g., `"https://example.com"`), or use scheme-specific subdomain wildcards (e.g., `"https://*.example.com"`). At least one origin must be specified. The global wildcard cannot be used with credentials. |
 | `allowedMethods` | array | No | `["GET", "POST", "PUT", "DELETE", "OPTIONS"]` | HTTP methods allowed for cross-origin requests. Valid values: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD. |
 | `allowedHeaders` | array | No | `[]` | Request headers that can be used in the actual request. Specify exact header names (e.g., `"Content-Type"`, `"Authorization"`). When using credentials, specific headers must be listed (no wildcards). |
 | `exposedHeaders` | array | No | `[]` | Response headers that browsers are allowed to access. Only these headers will be exposed to the client-side JavaScript code. |
-| `allowCredentials` | boolean | No | `false` | Indicates whether the response can be shared when credentials (cookies, authorization headers, TLS certificates) are included. When true, `allowedOrigins` cannot contain `"*"` and `allowedHeaders` cannot contain `"*"`. |
+| `allowCredentials` | boolean | No | `false` | Indicates whether the response can be shared when credentials (cookies, authorization headers, TLS certificates) are included. When true, `allowedOrigins` cannot contain the global `"*"` wildcard and `allowedHeaders` cannot contain `"*"`. |
 | `maxAge` | integer | No | `3600` | Maximum time in seconds that a preflight response can be cached by the browser. Valid range: 0 to 86400. Helps reduce the number of preflight requests. |
 | `forwardPreflight` | boolean | No | `false` | If true, forwards preflight requests that do not match the CORS policy to the upstream service instead of responding with CORS headers. |
 
@@ -138,9 +138,9 @@ spec:
       path: /profile/{id}
 ```
 
-### Example 3: Regex Pattern Origins
+### Example 3: Subdomain Wildcard Origins
 
-Allow origins matching a regex pattern:
+Allow HTTPS origins at any subdomain depth under `example.com`:
 
 ```yaml
 apiVersion: gateway.api-platform.wso2.com/v1alpha1
@@ -159,7 +159,7 @@ spec:
       version: v1
       params:
         allowedOrigins:
-          - "https://.*\.example\.com"  # Matches any subdomain of example.com
+          - "https://*.example.com"
           - "http://localhost:3000"
           - "http://localhost:8080"
         allowedMethods:
@@ -301,19 +301,20 @@ operations:
 
 When `allowCredentials` is set to `true`, the following constraints apply:
 
-- `allowedOrigins` cannot contain `"*"` (wildcard). You must specify explicit origins.
+- `allowedOrigins` cannot contain the global `"*"` wildcard. You must specify exact origins or scheme-specific subdomain wildcards.
 - `allowedHeaders` cannot contain `"*"` (wildcard). You must specify explicit header names.
 - `allowedMethods` cannot contain `"*"` (wildcard). You must specify explicit methods.
 - `exposedHeaders` cannot contain `"*"` (wildcard). You must specify explicit header names.
 
 These constraints are enforced by the CORS specification to prevent security issues when credentials are involved.
 
-**Regex Pattern Origins**
+**Subdomain Wildcard Origins**
 
-You can use regex patterns for `allowedOrigins` to match multiple origins dynamically. For example:
+Use a scheme-specific subdomain wildcard to match multiple subdomains:
 
-- `"https://.*\.example\.com"` matches `https://app.example.com`, `https://api.example.com`, etc.
-- `"http://localhost:(3000|8080)"` matches `http://localhost:3000` and `http://localhost:8080`
+- `"https://*.example.com"` matches `https://app.example.com`, `https://api.example.com`, and nested subdomains.
+- It does not match `http://app.example.com`, the apex `https://example.com`, or an origin with an unspecified port.
+- `"https://*.example.com:8443"` matches subdomains only when port `8443` is present.
 
 **Preflight Caching**
 

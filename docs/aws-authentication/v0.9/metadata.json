@@ -4,7 +4,8 @@
   "version": "1.0",
   "provider": "WSO2",
   "categories": [
-    "Security"
+    "Security",
+    "AI"
   ],
   "description": "Signs outbound requests to AWS-hosted backends using AWS Signature Version 4 (SigV4).\nSupports two credential-acquisition modes: AWS STS AssumeRole for temporary credentials,\nor a static IAM user access key/secret pair. Intended for backends such as API Gateway with\nIAM auth, Lambda Function URLs, OpenSearch, and S3 that require SigV4-signed requests."
 }

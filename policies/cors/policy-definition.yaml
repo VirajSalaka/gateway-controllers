@@ -1,5 +1,5 @@
 name: cors
-version: v1.0.1
+version: v1.0.2
 description: |
   Applies Cross-Origin Resource Sharing (CORS) rules by handling preflight
   requests and adding CORS headers to responses. Controls cross-origin access
@@ -13,8 +13,12 @@ parameters:
       x-wso2-policy-advanced-param: false
       description:
         Specifies allowed origins for cross-origin access. Supports "*", exact
-        origins, and regex patterns. At least one origin is required; otherwise
-        cross-origin requests are rejected.
+        origins, and subdomain wildcards such as "https://*.example.com".
+        Subdomain wildcards require and match only their configured scheme,
+        allow any subdomain depth, exclude the apex domain, and only match a
+        port when one is explicitly configured. Exact origins are matched
+        literally. At least one origin is required; otherwise cross-origin
+        requests are rejected.
       default:
         - "*"
       items:
@@ -72,7 +76,7 @@ parameters:
       type: boolean
       x-wso2-policy-advanced-param: true
       description: Specifies whether credentials are allowed in cross-origin requests.
-        When true, allowedOrigins cannot contain "*".
+        When true, allowedOrigins cannot contain the global "*" wildcard.
       default: false
     maxAge:
       type: integer

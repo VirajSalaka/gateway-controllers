@@ -206,9 +206,9 @@ func TestAPIKeyPolicy_OnRequestHeaders_SuccessWithValuePrefix(t *testing.T) {
 	}, "api-1", "OrdersAPI", "v1", "/orders")
 
 	action := p.OnRequestHeaders(context.Background(), ctx, map[string]interface{}{
-		"key":          "authorization",
-		"in":           "header",
-		"value-prefix": "Bearer ",
+		"key":         "authorization",
+		"in":          "header",
+		"valuePrefix": "Bearer ",
 	})
 
 	if ctx.SharedContext.AuthContext == nil || !ctx.SharedContext.AuthContext.Authenticated {
@@ -230,9 +230,9 @@ func TestAPIKeyPolicy_OnRequestHeaders_ValuePrefixIsCaseInsensitive(t *testing.T
 	}, "api-1", "OrdersAPI", "v1", "/orders")
 
 	action := p.OnRequestHeaders(context.Background(), ctx, map[string]interface{}{
-		"key":          "authorization",
-		"in":           "header",
-		"value-prefix": "bearer ",
+		"key":         "authorization",
+		"in":          "header",
+		"valuePrefix": "bearer ",
 	})
 
 	if ctx.SharedContext.AuthContext == nil || !ctx.SharedContext.AuthContext.Authenticated {
@@ -255,9 +255,9 @@ func TestAPIKeyPolicy_OnRequestHeaders_FailsWhenValuePrefixMissing(t *testing.T)
 	}, "api-1", "OrdersAPI", "v1", "/orders")
 
 	action := p.OnRequestHeaders(context.Background(), ctx, map[string]interface{}{
-		"key":          "authorization",
-		"in":           "header",
-		"value-prefix": "Bearer ",
+		"key":         "authorization",
+		"in":          "header",
+		"valuePrefix": "Bearer ",
 	})
 
 	assertUnauthorizedJSON(t, action)
